@@ -29,6 +29,7 @@ import org.cyclonedx.exception.ParseException;
 import org.cyclonedx.parsers.BomParserFactory;
 import org.cyclonedx.parsers.Parser;
 import org.datanucleus.flush.FlushMode;
+import org.dependencytrack.event.BomPedigreeAnalysisEvent;
 import org.dependencytrack.event.BomUploadEvent;
 import org.dependencytrack.event.NewVulnerableDependencyAnalysisEvent;
 import org.dependencytrack.event.PolicyEvaluationEvent;
@@ -54,6 +55,7 @@ import org.dependencytrack.notification.NotificationGroup;
 import org.dependencytrack.notification.NotificationScope;
 import org.dependencytrack.notification.vo.BomConsumedOrProcessed;
 import org.dependencytrack.notification.vo.BomProcessingFailed;
+import org.dependencytrack.parser.cyclonedx.CycloneDXPedigreeImporter;
 import org.dependencytrack.persistence.QueryManager;
 import org.dependencytrack.persistence.listener.IndexingInstanceLifecycleListener;
 import org.dependencytrack.util.InternalComponentIdentifier;
@@ -295,7 +297,20 @@ public class BomUploadProcessingTask implements Subscriber {
             });
         }
 
-        eventsToDispatch.add(createVulnAnalysisEvent(ctx, processedComponents));
+        // Apply pedigree patch analysis outside the main transaction, as analysis records
+        // can reference vulnerabilities that are shared across projects.
+        // This handles the re-upload case where components already have vulnerability findings.
+        try (final var pedigreeQm = new QueryManager()) {
+            final Project pedigreeProject = pedigreeQm.getObjectByUuid(Project.class, ctx.project.getUuid());
+            if (pedigreeProject != null) {
+                new CycloneDXPedigreeImporter().applyPedigree(pedigreeQm, cdxBom, pedigreeProject);
+            }
+        }
+
+        // Build a UUID-keyed pedigree map so we can chain pedigree analysis after vulnerability
+        // analysis for newly added components that won't have findings yet at this point.
+        final Map<UUID, Set<String>> pedigreeByComponentUuid = buildPedigreeMap(cdxBom, processedComponents);
+        eventsToDispatch.add(createVulnAnalysisEvent(ctx, processedComponents, pedigreeByComponentUuid));
         eventsToDispatch.add(createRepoMetaAnalysisEvent(ctx, processedComponents));
 
         final var processingDurationMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - ctx.startTimeNs);
@@ -825,11 +840,20 @@ public class BomUploadProcessingTask implements Subscriber {
         return pm.newQuery(ServiceComponent.class, ":ids.contains(id)").deletePersistentAll(serviceIds);
     }
 
-    private static Event createVulnAnalysisEvent(final Context ctx, final List<Component> components) {
+    private static Event createVulnAnalysisEvent(
+            final Context ctx,
+            final List<Component> components,
+            final Map<UUID, Set<String>> pedigreeByComponentUuid) {
         final var event = new ProjectVulnerabilityAnalysisEvent(
                 ctx.project, VulnerabilityAnalysisLevel.BOM_UPLOAD_ANALYSIS);
         event.setChainIdentifier(ctx.token);
+
         event.onSuccess(new PolicyEvaluationEvent(components).project(ctx.project));
+        if (!pedigreeByComponentUuid.isEmpty()) {
+            // Dispatch pedigree analysis concurrently after vuln analysis so that findings
+            // for new components exist by the time pedigree states are applied.
+            event.onSuccess(new BomPedigreeAnalysisEvent(ctx.project.getUuid(), pedigreeByComponentUuid));
+        }
 
         final List<Component> newComponents = components.stream().filter(Component::isNew).toList();
         if (!newComponents.isEmpty()) {
@@ -837,6 +861,27 @@ public class BomUploadProcessingTask implements Subscriber {
         }
 
         return event;
+    }
+
+    private static Map<UUID, Set<String>> buildPedigreeMap(
+            final org.cyclonedx.model.Bom cdxBom,
+            final List<Component> processedComponents) {
+        final Map<String, Set<String>> resolvedVulnIdsByBomRef =
+                CycloneDXPedigreeImporter.extractResolvedVulnIdsByBomRef(cdxBom);
+        if (resolvedVulnIdsByBomRef.isEmpty()) {
+            return Map.of();
+        }
+        final var result = new HashMap<UUID, Set<String>>();
+        for (final Component component : processedComponents) {
+            if (component.getBomRef() == null) {
+                continue;
+            }
+            final Set<String> resolvedIds = resolvedVulnIdsByBomRef.get(component.getBomRef());
+            if (resolvedIds != null && !resolvedIds.isEmpty()) {
+                result.put(component.getUuid(), resolvedIds);
+            }
+        }
+        return result;
     }
 
     private static Event createRepoMetaAnalysisEvent(final Context ctx, final List<Component> components) {

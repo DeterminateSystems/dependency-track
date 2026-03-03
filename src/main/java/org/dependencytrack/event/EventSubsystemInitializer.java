@@ -25,6 +25,7 @@ import alpine.event.framework.EventService;
 import alpine.event.framework.SingleThreadedEventService;
 import alpine.server.tasks.LdapSyncTask;
 import org.dependencytrack.common.ConfigKey;
+import org.dependencytrack.tasks.BomPedigreeAnalysisTask;
 import org.dependencytrack.tasks.BomUploadProcessingTask;
 import org.dependencytrack.tasks.CallbackTask;
 import org.dependencytrack.tasks.ClearComponentAnalysisCacheTask;
@@ -84,6 +85,7 @@ public class EventSubsystemInitializer implements ServletContextListener {
         LOGGER.info("Initializing asynchronous event subsystem");
 
         EVENT_SERVICE.subscribe(BomUploadEvent.class, BomUploadProcessingTask.class);
+        EVENT_SERVICE.subscribe(BomPedigreeAnalysisEvent.class, BomPedigreeAnalysisTask.class);
         EVENT_SERVICE.subscribe(VexUploadEvent.class, VexUploadProcessingTask.class);
         EVENT_SERVICE.subscribe(LdapSyncEvent.class, LdapSyncTask.class);
         EVENT_SERVICE.subscribe(GitHubAdvisoryMirrorEvent.class, GitHubAdvisoryMirrorTask.class);
@@ -126,6 +128,7 @@ public class EventSubsystemInitializer implements ServletContextListener {
         TaskScheduler.getInstance().shutdown();
 
         EVENT_SERVICE.unsubscribe(BomUploadProcessingTask.class);
+        EVENT_SERVICE.unsubscribe(BomPedigreeAnalysisTask.class);
         EVENT_SERVICE.unsubscribe(VexUploadProcessingTask.class);
         EVENT_SERVICE.unsubscribe(LdapSyncTask.class);
         EVENT_SERVICE.unsubscribe(GitHubAdvisoryMirrorTask.class);
